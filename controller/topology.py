@@ -42,9 +42,11 @@ class TopologyManager:
         self,
         topology: Optional[TopologyConfig] = None,
         key_manager: Optional[KeyManager] = None,
+        bgp_announcer = None,  # Optional[BgpRouteAnnouncer]
     ):
         self._topology = topology or TopologyConfig(name="default")
         self._key_manager = key_manager or KeyManager()
+        self._bgp = bgp_announcer
         self._allocator = AddressAllocator(
             network_cidr=self._topology.network_cidr
         )
@@ -52,6 +54,11 @@ class TopologyManager:
         self._version = 0
         self._auto_assign_addresses()
         self._auto_assign_keys()
+
+        # Announce initial routes via BGP if announcer is attached
+        if self._bgp:
+            self._bgp.set_topology(self)
+            self._announce_all_routes()
 
     def _auto_assign_addresses(self) -> None:
         """Auto-assign tunnel IPs to nodes that don't have one.
@@ -71,6 +78,22 @@ class TopologyManager:
                 kp = self._key_manager.get_or_generate(node.name)
                 node.private_key = kp.private_key
                 node.public_key = kp.public_key
+
+    def _announce_all_routes(self) -> None:
+        """Announce all current AllowedIPs via BGP."""
+        if not self._bgp:
+            return
+        for node in self._topology.nodes:
+            if node.allowed_ips and node.address:
+                self._bgp.announce_all_for_node(
+                    node.name, node.address, node.allowed_ips
+                )
+
+    def attach_bgp(self, bgp_announcer) -> None:
+        """Attach a BGP route announcer to this topology manager."""
+        self._bgp = bgp_announcer
+        self._bgp.set_topology(self)
+        self._announce_all_routes()
 
     @property
     def name(self) -> str:
@@ -308,6 +331,16 @@ class TopologyManager:
                         "peer_endpoint": peer.endpoint,
                         "new_allowed_ips_for_this_node": peer_allowed,
                     })
+
+        # Notify BGP announcer of prefix changes
+        if self._bgp:
+            next_hop = node.tunnel_ip() or (
+                node.address.split("/")[0] if "/" in node.address else node.address
+            )
+            for prefix in removed:
+                self._bgp.withdraw_route(prefix)
+            for prefix in added:
+                self._bgp.announce_route(prefix, next_hop)
 
         self._bump_version()
         return {

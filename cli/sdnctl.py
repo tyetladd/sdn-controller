@@ -397,6 +397,92 @@ class SdnCtl:
             self.key_manager.load_keys(path)
             print(f"Loaded {self.key_manager.node_count()} keys from {path}")
 
+    def cmd_bgp(self, args):
+        """Handle BGP subcommands."""
+        if args.bgp_action == "status":
+            if not self.tm or not self.tm._bgp:
+                print("No BGP announcer attached. Use 'bgp attach' first.")
+                return
+            status = self.tm._bgp.get_status()
+            print(f"BGP Backend: {status['backend']}")
+            print(f"Local AS:    {status['local_as']}")
+            print(f"Router ID:   {status['router_id']}")
+            print(f"Peers:       {status['peers']}")
+            print(f"Routes:      {status['announced_routes']}")
+            if status['routes']:
+                print(f"\nAnnounced routes:")
+                for r in status['routes']:
+                    print(f"  {r['prefix']:25s} via {r['next_hop']}")
+
+        elif args.bgp_action == "attach":
+            if not self.tm:
+                print("No topology loaded. Use -t <file> first.")
+                return
+            from controller.bgp import BgpRouteAnnouncer, BgpPeer
+
+            bgp = BgpRouteAnnouncer(
+                backend=args.backend or "gobgp",
+                local_as=args.local_as or 65001,
+                router_id=args.router_id or "10.0.0.1",
+            )
+            self.tm.attach_bgp(bgp)
+            print(f"BGP announcer attached (backend={bgp.backend}, AS={bgp.local_as})")
+            status = bgp.get_status()
+            print(f"Initial routes announced: {status['announced_routes']}")
+            for r in status['routes']:
+                print(f"  {r['prefix']:25s} via {r['next_hop']}")
+
+        elif args.bgp_action == "announce":
+            if not self.tm or not self.tm._bgp:
+                print("No BGP announcer. Use 'bgp attach' first.")
+                return
+            success = self.tm._bgp.announce_route(
+                args.prefix, args.next_hop,
+            )
+            print(f"Announced {args.prefix} via {args.next_hop}: {'OK' if success else 'FAILED'}")
+
+        elif args.bgp_action == "withdraw":
+            if not self.tm or not self.tm._bgp:
+                print("No BGP announcer. Use 'bgp attach' first.")
+                return
+            success = self.tm._bgp.withdraw_route(args.prefix)
+            print(f"Withdrawn {args.prefix}: {'OK' if success else 'FAILED'}")
+
+        elif args.bgp_action == "peers":
+            if not self.tm or not self.tm._bgp:
+                print("No BGP announcer. Use 'bgp attach' first.")
+                return
+            from controller.bgp import BgpPeer
+
+            if hasattr(args, 'add_peer') and args.add_peer:
+                self.tm._bgp.add_peer(BgpPeer(
+                    neighbor_ip=args.add_peer,
+                    remote_as=args.remote_as or 65000,
+                    description=args.description or "",
+                ))
+                print(f"Added BGP peer {args.add_peer} (AS{args.remote_as})")
+            else:
+                peers = self.tm._bgp.list_peers()
+                if not peers:
+                    print("No BGP peers configured.")
+                else:
+                    for p in peers:
+                        print(f"  {p['neighbor_ip']} AS{p['remote_as']} ({p['description']})")
+
+        elif args.bgp_action == "config":
+            if not self.tm or not self.tm._bgp:
+                print("No BGP announcer. Use 'bgp attach' first.")
+                return
+            if args.config_type == "bird":
+                self.tm._bgp.backend = "bird"
+                print(self.tm._bgp._write_bird_config() or "BIRD config generated")
+                config_path = self.tm._bgp.config_dir / "bird.conf"
+                with open(config_path) as f:
+                    print(f.read())
+            else:
+                config = self.tm._bgp.generate_gobgp_config()
+                print(config)
+
     def cmd_server(self, args):
         """Start the REST API server."""
         if not self.tm:
@@ -529,6 +615,26 @@ def main():
     load_keys = key_sub.add_parser("load", help="Load keys from file")
     load_keys.add_argument("file", help="Input file")
 
+    # ── bgp ──────────────────────────────────────────────────────
+    bgp_parser = subparsers.add_parser("bgp", help="BGP route announcer")
+    bgp_sub = bgp_parser.add_subparsers(dest="bgp_action")
+    bgp_sub.add_parser("status", help="Show BGP announcer status")
+    attach_bgp = bgp_sub.add_parser("attach", help="Attach BGP announcer to topology")
+    attach_bgp.add_argument("--backend", choices=["gobgp", "bird"], default="gobgp")
+    attach_bgp.add_argument("--local-as", type=int, default=65001)
+    attach_bgp.add_argument("--router-id", default="10.0.0.1")
+    announce_bgp = bgp_sub.add_parser("announce", help="Manually announce a route")
+    announce_bgp.add_argument("prefix", help="CIDR prefix")
+    announce_bgp.add_argument("next_hop", help="Next-hop IP")
+    withdraw_bgp = bgp_sub.add_parser("withdraw", help="Withdraw a route")
+    withdraw_bgp.add_argument("prefix", help="CIDR prefix")
+    peers_bgp = bgp_sub.add_parser("peers", help="List/add BGP peers")
+    peers_bgp.add_argument("--add-peer", help="Add a BGP peer (IP)")
+    peers_bgp.add_argument("--remote-as", type=int, default=65000)
+    peers_bgp.add_argument("--description", default="")
+    config_bgp = bgp_sub.add_parser("config", help="Generate BGP daemon config")
+    config_bgp.add_argument("--config-type", choices=["gobgp", "bird"], default="gobgp")
+
     # ── server ───────────────────────────────────────────────────
     srv_parser = subparsers.add_parser("server", help="Start API server")
     srv_parser.add_argument("--host", default="0.0.0.0")
@@ -569,6 +675,7 @@ def main():
         "policy": ctl.cmd_policy,
         "config": ctl.cmd_config,
         "key": ctl.cmd_key,
+        "bgp": ctl.cmd_bgp,
         "server": ctl.cmd_server,
     }
 

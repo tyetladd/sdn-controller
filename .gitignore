@@ -6,6 +6,7 @@ venv/
 .venv/
 configs/
 keys/
+bgp-configs/
 *.conf
 *.awg.conf
 /dist/

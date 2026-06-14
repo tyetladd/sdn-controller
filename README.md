@@ -11,6 +11,7 @@ A Software-Defined Networking prototype that creates and manages overlay network
 - **REST API** — 15+ endpoints for full programmatic control
 - **CLI Tool** — `sdnctl` for one-shot management operations
 - **Node Agent** — Per-node daemon for config application and health monitoring
+- **BGP Route Announcer** — Announces SDN overlay routes to local routers via GoBGP/BIRD
 - **AmneziaWG Support** — Junk packet injection, handshake obfuscation, header masking
 
 ## Supported Topologies
@@ -107,6 +108,7 @@ PersistentKeepalive = 25
 | PUT | `/api/v1/nodes/<name>/allowed-ips` | **Runtime:** update a node's AllowedIPs |
 | POST | `/api/v1/nodes/<name>/allowed-ips/add` | **Runtime:** add a single prefix |
 | POST | `/api/v1/nodes/<name>/allowed-ips/remove` | **Runtime:** remove a single prefix |
+| GET | `/api/v1/bgp/status` | BGP announcer status and route table |
 
 ## How Traffic Routing Works
 
@@ -268,6 +270,127 @@ What you **cannot** change at runtime: the listen port (requires interface resta
    No restart, no packet loss, no re-handshake on OTHER peers.
 ```
 
+## BGP Route Announcer: Integrating with Local Routers
+
+The SDN overlay operates in its own address space (e.g. `10.20.0.0/16`). To make these routes reachable from the wider network, the controller runs a **BGP route announcer** in parallel. It watches for AllowedIPs changes and announces/withdraws routes to local routers via standard BGP.
+
+```
+                    SDN Controller
+               ┌──────────────────┐
+               │ Topology Manager  │
+               │                  │
+               │ AllowedIPs change │
+               │   ├─ 10.99.0.0/24│
+               │   └─ next_hop    │
+               └────────┬─────────┘
+                        │ push prefix + next_hop
+                        ▼
+               ┌──────────────────┐     BGP peering    ┌──────────┐
+               │ BGP Route        │◄──────────────────►│  Local   │
+               │ Announcer        │   AS 65001         │  Router  │
+               │ (GoBGP / BIRD)   │                    │ AS 65000 │
+               └──────────────────┘                    └──────────┘
+```
+
+### How it works
+
+When `add_node_prefix("spoke-office-1", "10.99.0.0/24")` is called:
+
+1. Topology manager updates the node's AllowedIPs
+2. Topology manager notifies the BGP announcer: "announce `10.99.0.0/24` via `10.20.1.1`"
+3. BGP announcer injects the route into GoBGP's RIB:
+   ```bash
+   gobgp global rib add 10.99.0.0/24 nexthop 10.20.1.1 origin igp
+   ```
+4. GoBGP announces the route to all BGP peers (local routers)
+5. Local routers now know: "to reach 10.99.0.0/24, send traffic to 10.20.1.1"
+6. `10.20.1.1` is the WireGuard tunnel IP of spoke-office-1 — traffic goes through the tunnel
+
+When the prefix is removed, the BGP announcer withdraws the route:
+```bash
+gobgp global rib del 10.99.0.0/24
+```
+
+### Using the BGP Announcer
+
+**Via CLI:**
+
+```bash
+# Attach BGP to the topology (announces all current routes)
+sdnctl -t hub_spoke.yaml bgp attach --backend gobgp --local-as 65001
+
+# Check what's being announced
+sdnctl -t hub_spoke.yaml bgp status
+
+# Add a peer (local router to peer with)
+sdnctl -t hub_spoke.yaml bgp peers --add-peer 192.168.100.1 --remote-as 65000
+
+# Manually announce/withdraw routes
+sdnctl -t hub_spoke.yaml bgp announce 10.99.0.0/24 10.20.1.1
+sdnctl -t hub_spoke.yaml bgp withdraw 10.99.0.0/24
+
+# Generate daemon config files
+sdnctl -t hub_spoke.yaml bgp config --config-type gobgp  # gobgpd.toml
+sdnctl -t hub_spoke.yaml bgp config --config-type bird    # bird.conf
+```
+
+**Via API (automatic BGP on prefix changes):**
+
+```bash
+# The controller with BGP attached automatically announces
+# routes when AllowedIPs change:
+curl -X POST .../api/v1/nodes/spoke-office-1/allowed-ips/add \
+  -d '{"prefix": "10.99.0.0/24"}'
+# → BGP route 10.99.0.0/24 via 10.20.1.1 is now announced
+```
+
+**Via Python (programmatic):**
+
+```python
+from controller.bgp import BgpRouteAnnouncer, BgpPeer
+
+bgp = BgpRouteAnnouncer(backend="gobgp", local_as=65001, router_id="10.20.0.1")
+bgp.add_peer(BgpPeer("192.168.100.1", remote_as=65000))
+
+# Attach to topology — routes auto-sync on AllowedIPs changes
+tm.attach_bgp(bgp)
+
+# Or manually announce
+bgp.announce_route("10.99.0.0/24", next_hop="10.20.1.1")
+bgp.withdraw_route("10.99.0.0/24")
+```
+
+### Supported BGP backends
+
+| Backend | Mode | Description |
+|---------|------|-------------|
+| **GoBGP** (`gobgp`) | CLI | Inject routes via `gobgp global rib add/del`. Daemon handles BGP protocol. |
+| **GoBGP gRPC** (`gobgp-grpc`) | API | Direct gRPC to gobgpd for programmatic route injection (requires `grpcio`) |
+| **BIRD** (`bird`) | Config | Generates `bird.conf` with static routes exported via BGP protocol |
+
+### Deploying GoBGP alongside the controller
+
+```bash
+# Start GoBGP daemon with our config
+sdnctl -t hub_spoke.yaml bgp config --config-type gobgp > /etc/gobgp/gobgpd.toml
+gobgpd -f /etc/gobgp/gobgpd.toml &
+
+# Verify peering
+gobgp neighbor
+gobgp global rib
+```
+
+### BGP auto-watcher
+
+The BGP announcer can run a background watcher that reconciles topology changes with the BGP RIB:
+
+```python
+bgp.start_watching(interval=5.0)  # polls topology every 5s
+# ... make topology changes ...
+# BGP routes are automatically added/withdrawn
+bgp.stop_watching()
+```
+
 ## Architecture
 
 ```
@@ -279,14 +402,15 @@ Controller (Python)               Node Agents (Python)
 │ Policy Engine        │          │ Health Monitor        │
 │ Key Manager          │          │ Traffic Stats         │
 │ Route Calculator     │          │ Alert Manager         │
-└──────────────────────┘          └──────┬───────────────┘
-                                         │
-                                         ▼
-                                ┌──────────────────────┐
-                                │ WireGuard/AmneziaWG   │
-                                │ Kernel cryptokey route │
-                                │ + IP forwarding (hub)  │
-                                └──────────────────────┘
+│ BGP Route Announcer  │          └──────┬───────────────┘
+└──────────┬───────────┘                  │
+           │ BGP peering                  ▼
+           │ (GoBGP/BIRD)        ┌──────────────────────┐
+           ▼                     │ WireGuard/AmneziaWG   │
+┌──────────────────────┐         │ Kernel cryptokey route │
+│ Local Router          │         │ + IP forwarding (hub)  │
+│ (learns SDN routes)   │         └──────────────────────┘
+└──────────────────────┘
 ```
 
 ## AmneziaWG vs WireGuard
