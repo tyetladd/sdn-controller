@@ -159,16 +159,18 @@ class NodeAgent:
         if new_hash == self._config_hash:
             return True  # No change
 
-        self._config_hash = new_hash
-
         # In a real deployment, apply the config:
-        # 1. Write config file
+        # 1. Write config file (do this BEFORE setting hash so failure allows retry)
         self.config_dir.mkdir(parents=True, exist_ok=True)
         config_file = self.config_dir / f"{self.interface}.conf"
         self._write_wg_config(config, config_file)
 
         # 2. Apply via wg-quick or wg syncconf
-        self._apply_wireguard_config(config_file)
+        applied = self._apply_wireguard_config(config_file)
+
+        # Only cache the hash after successful write + apply
+        if applied:
+            self._config_hash = new_hash
 
         # Update status
         self._status = NodeStatus(
@@ -429,6 +431,9 @@ class NodeAgent:
 
         Gets the current AllowedIPs, appends the new prefix,
         and applies the update atomically via `wg set`.
+        When _status is None (config not yet applied), the prefix
+        is still added — the peer's existing AllowedIPs in the
+        kernel are preserved by querying `wg show` first.
         """
         current_ips = []
         if self._status:
@@ -436,6 +441,10 @@ class NodeAgent:
                 if ps.peer_public_key == peer_public_key:
                     current_ips = list(ps.allowed_ips)
                     break
+
+        # If _status is not set, query kernel for current AllowedIPs
+        if not self._status:
+            current_ips = self._get_kernel_allowed_ips(peer_public_key)
 
         if prefix not in current_ips:
             current_ips.append(prefix)
@@ -455,7 +464,31 @@ class NodeAgent:
                     ]
                     break
 
+        # If _status is not set, query kernel for current AllowedIPs
+        if not self._status:
+            current_ips = self._get_kernel_allowed_ips(peer_public_key)
+            current_ips = [ip for ip in current_ips if ip != prefix]
+
         return self.update_peer_allowed_ips(peer_public_key, current_ips)
+
+    def _get_kernel_allowed_ips(self, peer_public_key: str) -> List[str]:
+        """Query the WireGuard kernel interface for a peer's current AllowedIPs."""
+        try:
+            result = subprocess.run(
+                ["wg", "show", self.interface, "allowed-ips"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                ips = []
+                for line in result.stdout.strip().split("\n"):
+                    parts = line.split("\t")
+                    if len(parts) >= 2 and parts[0].strip() == peer_public_key:
+                        ips = [ip.strip() for ip in parts[1].split(",") if ip.strip()]
+                        break
+                return ips
+        except (FileNotFoundError, subprocess.SubprocessError):
+            pass
+        return []
 
     def _public_key_from_private(self, private_key: str) -> str:
         """Derive public key from private key using wg CLI."""

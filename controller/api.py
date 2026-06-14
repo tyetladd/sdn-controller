@@ -147,6 +147,16 @@ def create_app(
 
     # ── Runtime Reconfiguration ──────────────────────────────────
 
+    @staticmethod
+    def _validate_cidr(prefix: str) -> bool:
+        """Validate that a string is a valid CIDR notation."""
+        import ipaddress
+        try:
+            ipaddress.ip_network(prefix, strict=False)
+            return True
+        except ValueError:
+            return False
+
     @app.route("/api/v1/nodes/<name>/allowed-ips", methods=["PUT"])
     def update_node_allowed_ips(name: str):
         """Update a node's AllowedIPs at runtime (live reconfiguration).
@@ -157,7 +167,15 @@ def create_app(
         No tunnels are dropped — peers can be updated via `wg set`.
         """
         data = request.get_json(force=True)
-        new_ips = data.get("allowed_ips", [])
+        if "allowed_ips" not in data:
+            return jsonify({"error": "missing required field: allowed_ips"}), 400
+        new_ips = data["allowed_ips"]
+        if not isinstance(new_ips, list):
+            return jsonify({"error": "allowed_ips must be a list"}), 400
+        # Validate all entries are valid CIDRs
+        for ip in new_ips:
+            if not _validate_cidr(ip):
+                return jsonify({"error": f"invalid CIDR: {ip}"}), 400
         try:
             result = tm.update_node_allowed_ips(name, new_ips)
             return jsonify(result)
@@ -177,6 +195,8 @@ def create_app(
         prefix = data.get("prefix", "")
         if not prefix:
             return jsonify({"error": "prefix is required"}), 400
+        if not _validate_cidr(prefix):
+            return jsonify({"error": f"invalid CIDR: {prefix}"}), 400
         try:
             result = tm.add_node_prefix(name, prefix)
             return jsonify(result)
@@ -193,11 +213,22 @@ def create_app(
         prefix = data.get("prefix", "")
         if not prefix:
             return jsonify({"error": "prefix is required"}), 400
+        if not _validate_cidr(prefix):
+            return jsonify({"error": f"invalid CIDR: {prefix}"}), 400
         try:
             result = tm.remove_node_prefix(name, prefix)
             return jsonify(result)
         except ValueError as e:
             return jsonify({"error": str(e)}), 404
+
+    # ── BGP Status ───────────────────────────────────────────────
+
+    @app.route("/api/v1/bgp/status", methods=["GET"])
+    def bgp_status():
+        """Get BGP announcer status and route table."""
+        if not hasattr(tm, '_bgp') or not tm._bgp:
+            return jsonify({"error": "BGP announcer not attached"}), 404
+        return jsonify(tm._bgp.get_status())
 
     # ── Policies ─────────────────────────────────────────────────
 

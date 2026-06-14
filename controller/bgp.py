@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Set
-from threading import Thread, Event
+from threading import Thread, Event, Lock
 
 
 @dataclass
@@ -98,6 +98,7 @@ class BgpRouteAnnouncer:
         self.config_dir = config_dir or Path("./bgp-configs")
         self._peers: List[BgpPeer] = []
         self._announced: Dict[str, BgpRoute] = {}  # prefix -> route
+        self._lock = Lock()  # Protects _announced and _peers
         self._watch_thread: Optional[Thread] = None
         self._stop_event = Event()
         self._topology = None  # Will be set by controller
@@ -158,46 +159,69 @@ class BgpRouteAnnouncer:
             local_pref=local_pref,
         )
 
-        if prefix in self._announced:
-            # Update existing route
-            return self._update_route(route)
+        with self._lock:
+            if prefix in self._announced:
+                # Update existing route via proper backend dispatch
+                return self._update_route(route)
 
-        # Announce via chosen backend
-        if self.backend == "gobgp":
-            success = self._gobgp_add_route(route)
-        elif self.backend == "gobgp-grpc":
-            success = self._gobgp_grpc_add_route(route)
-        elif self.backend == "bird":
-            success = self._bird_add_route(route)
-        else:
-            raise ValueError(f"Unknown backend: {self.backend}")
+            # For BIRD backend: store route first so _write_bird_config includes it
+            if self.backend == "bird":
+                self._announced[prefix] = route
+                success = self._dispatch_add(route)
+                if not success:
+                    del self._announced[prefix]
+                return success
 
-        if success:
-            self._announced[prefix] = route
-        return success
+            # Announce via chosen backend
+            success = self._dispatch_add(route)
+
+            if success:
+                self._announced[prefix] = route
+            return success
 
     def withdraw_route(self, prefix: str) -> bool:
         """Withdraw a previously announced route.
 
         Called when a prefix is removed from a node's AllowedIPs.
         """
-        if prefix not in self._announced:
-            return True  # Nothing to withdraw
+        with self._lock:
+            if prefix not in self._announced:
+                return True  # Nothing to withdraw
 
-        route = self._announced[prefix]
+            route = self._announced[prefix]
 
+            # For BIRD backend: remove from dict first so config is written without it
+            if self.backend == "bird":
+                del self._announced[prefix]
+                return self._dispatch_del(route)
+
+            success = self._dispatch_del(route)
+
+            if success:
+                del self._announced[prefix]
+            return success
+
+    def _dispatch_add(self, route: 'BgpRoute') -> bool:
+        """Dispatch add to the correct backend."""
         if self.backend == "gobgp":
-            success = self._gobgp_del_route(route)
+            return self._gobgp_add_route(route)
         elif self.backend == "gobgp-grpc":
-            success = self._gobgp_grpc_del_route(route)
+            return self._gobgp_grpc_add_route(route)
         elif self.backend == "bird":
-            success = self._bird_del_route(route)
+            return self._bird_add_route(route)
         else:
             raise ValueError(f"Unknown backend: {self.backend}")
 
-        if success:
-            del self._announced[prefix]
-        return success
+    def _dispatch_del(self, route: 'BgpRoute') -> bool:
+        """Dispatch delete to the correct backend."""
+        if self.backend == "gobgp":
+            return self._gobgp_del_route(route)
+        elif self.backend == "gobgp-grpc":
+            return self._gobgp_grpc_del_route(route)
+        elif self.backend == "bird":
+            return self._bird_del_route(route)
+        else:
+            raise ValueError(f"Unknown backend: {self.backend}")
 
     def announce_all_for_node(
         self, node_name: str, node_address: str, prefixes: List[str]
@@ -232,37 +256,61 @@ class BgpRouteAnnouncer:
         return self._run_gobgp(args)
 
     def _update_route(self, route: BgpRoute) -> bool:
-        """Update an existing route (del + add)."""
-        self._gobgp_del_route(route)
-        return self._gobgp_add_route(route)
+        """Update an existing route (del + add) via proper backend dispatch."""
+        old_route = self._announced.get(route.prefix, route)
+
+        # For BIRD backend: update _announced first so config includes new route
+        if self.backend == "bird":
+            self._announced[route.prefix] = route
+            self._dispatch_del(old_route)
+            success = self._dispatch_add(route)
+            if not success:
+                self._announced[route.prefix] = old_route  # rollback
+            return success
+
+        self._dispatch_del(old_route)
+        success = self._dispatch_add(route)
+        if success:
+            self._announced[route.prefix] = route
+        return success
 
     def _run_gobgp(self, args: List[str]) -> bool:
         """Run a gobgp CLI command.
 
-        Returns True on success or if the daemon isn't running
-        (routes are tracked locally in that case).
+        Returns:
+            True: command succeeded or daemon isn't running (tracked locally)
+            False: real error that should not be silently accepted
         """
         try:
             result = subprocess.run(
                 args, capture_output=True, text=True, timeout=5,
             )
-            stderr = result.stderr.strip() if result.stderr else ""
-            if result.returncode != 0:
-                # "already exists" and "not found" are non-fatal for add/del
-                if any(x in stderr for x in ("already exists", "not found")):
-                    return True
-                # "connection refused" / "unavailable" means daemon isn't running
-                if any(x in stderr for x in ("Unavailable", "connection refused",
-                                              "transport", "deadline", "connect")):
-                    return True  # Track locally
-                if stderr:
-                    print(f"  gobgp: {stderr}")
-                return True  # Track locally on any non-fatal error
-            return True
+            # gobgp prints errors to stdout, not stderr
+            output = (result.stdout + result.stderr).strip().lower()
+            if result.returncode == 0:
+                return True
+
+            # "already exists" and "not found" are non-fatal for add/del
+            if any(x in output for x in ("already exists", "not found")):
+                return True
+
+            # Daemon-not-running indicators — track locally
+            daemon_down_markers = (
+                "connection refused", "unavailable",
+                "transport is closing", "deadline exceeded",
+                "context deadline", "connection reset",
+            )
+            if any(m in output for m in daemon_down_markers):
+                return True  # Track locally when daemon is down
+
+            # Real error — report and return False
+            if output:
+                print(f"  gobgp error: {output[:200]}")
+            return False
         except FileNotFoundError:
-            return True  # Track locally
+            return True  # Track locally when gobgp not installed
         except subprocess.SubprocessError:
-            return True  # Track locally
+            return True  # Track locally on subprocess failure
 
     def get_gobgp_rib(self) -> List[Dict[str, Any]]:
         """Query GoBGP's global RIB to see announced routes."""
@@ -296,11 +344,11 @@ class BgpRouteAnnouncer:
     # ── BIRD config generation backend ───────────────────────────────
 
     def _bird_add_route(self, route: BgpRoute) -> bool:
-        """Regenerate and write the BIRD config with this route."""
+        """Add route to BIRD config — must be called AFTER route is in _announced."""
         return self._write_bird_config()
 
     def _bird_del_route(self, route: BgpRoute) -> bool:
-        """Regenerate and write the BIRD config without this route."""
+        """Remove route from BIRD config — must be called BEFORE route is removed from _announced."""
         return self._write_bird_config()
 
     def _write_bird_config(self) -> bool:
@@ -465,18 +513,19 @@ class BgpRouteAnnouncer:
             f"[global.config]",
             f"  as = {self.local_as}",
             f"  router-id = \"{self.router_id}\"",
-            "",
-            "[[neighbors]]",
         ]
 
-        for i, peer in enumerate(self._peers):
-            if i > 0:
+        if self._peers:
+            lines.append("")
+            for i, peer in enumerate(self._peers):
                 lines.append("[[neighbors]]")
-            lines.extend([
-                f'  [neighbors.config]',
-                f'    neighbor-address = "{peer.neighbor_ip}"',
-                f'    peer-as = {peer.remote_as}',
-            ])
+                lines.extend([
+                    f'  [neighbors.config]',
+                    f'    neighbor-address = "{peer.neighbor_ip}"',
+                    f'    peer-as = {peer.remote_as}',
+                ])
+                if i < len(self._peers) - 1:
+                    lines.append("")
 
         config = "\n".join(lines) + "\n"
 

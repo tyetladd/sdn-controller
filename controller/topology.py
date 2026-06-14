@@ -79,6 +79,20 @@ class TopologyManager:
                 node.private_key = kp.private_key
                 node.public_key = kp.public_key
 
+    @staticmethod
+    def _derive_public_key(private_key: str) -> str:
+        """Derive a Curve25519 public key from a private key using wg CLI."""
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["wg", "pubkey"],
+                input=private_key, capture_output=True, text=True, check=True,
+            )
+            return result.stdout.strip()
+        except (FileNotFoundError, subprocess.SubprocessError):
+            # Fallback: cannot derive without wg CLI; store a placeholder
+            return ""
+
     def _announce_all_routes(self) -> None:
         """Announce all current AllowedIPs via BGP."""
         if not self._bgp:
@@ -138,13 +152,13 @@ class TopologyManager:
             private_key = keypair.private_key
             public_key = keypair.public_key
         else:
-            kp = self._key_manager.get_or_generate(name)
-            public_key = kp.public_key
+            # Derive public key from the provided private key
+            public_key = self._derive_public_key(private_key)
 
         # Allocate tunnel IP if not specified
         if not address:
             ip = self._allocator.allocate_ip(name)
-            address = f"{ip}/24"
+            address = f"{ip}/32"
 
         node = NodeConfig(
             name=name,
@@ -158,6 +172,13 @@ class TopologyManager:
             tags=tags or {},
         )
         self._topology.nodes.append(node)
+
+        # Announce initial AllowedIPs via BGP
+        if self._bgp and node.allowed_ips and node.address:
+            self._bgp.announce_all_for_node(
+                node.name, node.address, node.allowed_ips
+            )
+
         self._bump_version()
         return node
 
@@ -172,6 +193,10 @@ class TopologyManager:
             t for t in self._topology.tunnels
             if t.source_node != name and t.target_node != name
         ]
+
+        # Withdraw BGP routes before removing the node
+        if self._bgp and node.allowed_ips:
+            self._bgp.withdraw_all_for_node(node.allowed_ips)
 
         # Remove the node
         self._topology.nodes = [
@@ -504,6 +529,12 @@ class TopologyManager:
         )
         self._version = 0
         self._auto_assign_addresses()
+        self._auto_assign_keys()
+
+        # Reconcile BGP routes for the new topology
+        if self._bgp:
+            self._bgp.set_topology(self)
+            self._announce_all_routes()
 
     def save(self, path: Path) -> None:
         """Save topology to a JSON file."""
