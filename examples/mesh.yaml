@@ -1,0 +1,88 @@
+# Mesh Network Topology
+# Every node connects to every other node.
+# Best for small deployments (3-10 nodes) where any-to-any
+# connectivity is needed with minimal latency.
+#
+# Use case: Distributed microservices, multi-DC replication
+
+name: mesh-network
+description: |
+  Fully connected mesh topology using AmneziaWG tunnels.
+  Each node has a direct tunnel to every other node.
+  Suitable for up to ~10 nodes before the N*(N-1)/2 tunnel
+  count becomes unwieldy.
+
+version: "1.0"
+network_cidr: 10.0.0.0/8
+mtu: 1420
+
+# Global obfuscation settings (applied to all tunnels)
+obfuscation_enabled: true
+default_obfuscation:
+  enabled: true
+  Jc: 5          # 5 junk packets before real data
+  Jmin: 40       # Min junk packet size
+  Jmax: 80       # Max junk packet size
+
+nodes:
+  - name: node-nyc
+    endpoint: 198.51.100.10:51820
+    address: 10.10.1.1/32
+    allowed_ips:
+      - 10.10.1.0/24
+    tags:
+      region: us-east
+      role: edge
+
+  - name: node-lon
+    endpoint: 203.0.113.20:51820
+    address: 10.10.2.1/32
+    allowed_ips:
+      - 10.10.2.0/24
+    tags:
+      region: eu-west
+      role: edge
+
+  - name: node-sgp
+    endpoint: 192.0.2.30:51820
+    address: 10.10.3.1/32
+    allowed_ips:
+      - 10.10.3.0/24
+    tags:
+      region: ap-southeast
+      role: edge
+
+  - name: node-sfo
+    endpoint: 198.51.100.40:51820
+    address: 10.10.4.1/32
+    allowed_ips:
+      - 10.10.4.0/24
+    tags:
+      region: us-west
+      role: edge
+
+tunnels:
+  # Full mesh: every node connects to every other
+  - node-nyc:node-lon
+  - node-nyc:node-sgp
+  - node-nyc:node-sfo
+  - node-lon:node-sgp
+  - node-lon:node-sfo
+  - node-sgp:node-sfo
+
+policies:
+  # Allow all inter-region traffic
+  - name: allow-all-inter-region
+    source: 10.0.0.0/8
+    destination: 10.0.0.0/8
+    action: allow
+    priority: 100
+
+  # Restrict SSH from APAC to US (example)
+  - name: restrict-ssh-apac-to-us
+    source: 10.10.3.0/24
+    destination: 10.10.1.0/24
+    action: deny
+    port: 22
+    protocol: tcp
+    priority: 50

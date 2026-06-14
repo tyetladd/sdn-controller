@@ -1,0 +1,6 @@
+# SDN Controller over AmneziaWG Tunnels
+# Core dependencies
+
+PyYAML>=6.0
+flask>=3.0
+requests>=2.28

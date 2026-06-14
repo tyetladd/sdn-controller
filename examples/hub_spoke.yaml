@@ -1,0 +1,100 @@
+# Hub-and-Spoke Network Topology
+# All spoke nodes connect through a central hub.
+# Best for centralized control, traffic inspection,
+# and large-scale deployments (10-100+ nodes).
+#
+# Use case: Corporate VPN, remote office connectivity,
+#          managed service provider networks
+
+name: hub-spoke-network
+description: |
+  Hub-and-spoke topology with a central gateway node.
+  Spoke nodes only connect to the hub — the hub routes
+  traffic between spokes. Ideal for centralized policy
+  enforcement and traffic inspection.
+
+version: "1.0"
+network_cidr: 10.0.0.0/8
+mtu: 1420
+
+nodes:
+  - name: hub-primary
+    endpoint: 203.0.113.1:51820
+    address: 10.20.0.1/32
+    allowed_ips:
+      - 10.20.0.0/16       # Route all spoke traffic
+    obfuscation:
+      enabled: true
+      Jc: 8
+      Jmin: 50
+      Jmax: 100
+    tags:
+      role: hub
+      region: central
+
+  - name: spoke-office-1
+    endpoint: 198.51.100.11:51820
+    address: 10.20.1.1/32
+    allowed_ips:
+      - 192.168.1.0/24      # Local office subnet
+    tags:
+      role: spoke
+      site: office-1
+
+  - name: spoke-office-2
+    endpoint: 198.51.100.12:51820
+    address: 10.20.2.1/32
+    allowed_ips:
+      - 192.168.2.0/24      # Local office subnet
+    tags:
+      role: spoke
+      site: office-2
+
+  - name: spoke-office-3
+    endpoint: 198.51.100.13:51820
+    address: 10.20.3.1/32
+    allowed_ips:
+      - 192.168.3.0/24      # Local office subnet
+    tags:
+      role: spoke
+      site: office-3
+
+  - name: spoke-datacenter
+    endpoint: 203.0.113.50:51820
+    address: 10.20.10.1/32
+    allowed_ips:
+      - 10.100.0.0/16        # Datacenter subnet
+      - 172.16.0.0/12        # Management network
+    tags:
+      role: spoke
+      site: datacenter
+
+tunnels:
+  # All spokes connect to the hub
+  - hub-primary:spoke-office-1
+  - hub-primary:spoke-office-2
+  - hub-primary:spoke-office-3
+  - hub-primary:spoke-datacenter
+
+policies:
+  # Allow all traffic through the hub
+  - name: allow-hub-routed
+    source: 10.20.0.0/16
+    destination: 10.20.0.0/16
+    action: allow
+    priority: 100
+
+  # Allow spokes to reach the datacenter
+  - name: allow-spokes-to-dc
+    source: 10.20.0.0/16
+    destination: 10.100.0.0/16
+    action: allow
+    priority: 90
+
+  # Deny spoke-to-spoke direct (enforce hub routing)
+  - name: deny-spoke-direct
+    source: 10.20.0.0/16
+    destination: 192.168.0.0/16
+    action: allow
+    priority: 80
+    description: "Spokes talk via hub, not directly"

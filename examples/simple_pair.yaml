@@ -1,0 +1,37 @@
+# Simple Pair Topology
+# Minimal two-node setup. Quick test/development topology.
+#
+# Use case: Development, testing, point-to-point links
+
+name: simple-pair
+description: "Simple two-node point-to-point link for testing"
+version: "1.0"
+network_cidr: 10.0.0.0/8
+mtu: 1420
+
+nodes:
+  - name: node-alpha
+    endpoint: 192.168.1.10:51820
+    address: 10.255.1.1/32
+    allowed_ips:
+      - 10.255.1.0/24
+    tags:
+      env: test
+
+  - name: node-beta
+    endpoint: 192.168.2.20:51820
+    address: 10.255.1.2/32
+    allowed_ips:
+      - 10.255.2.0/24
+    tags:
+      env: test
+
+tunnels:
+  - node-alpha:node-beta
+
+policies:
+  - name: allow-all
+    source: 10.255.0.0/16
+    destination: 10.255.0.0/16
+    action: allow
+    priority: 100

@@ -1,0 +1,124 @@
+# Site-to-Site Network Topology
+# Connects two or more sites with redundant tunnels.
+# Best for connecting data centers, cloud regions,
+# or branch offices with dedicated links.
+#
+# Use case: Multi-cloud connectivity, DC interconnect,
+#          hybrid cloud networking
+
+name: site-to-site-network
+description: |
+  Site-to-site topology connecting two sites (US-East and EU-West)
+  with redundant tunnels for high availability. Each site has
+  two gateway nodes with tunnels to both gateways at the peer site.
+
+version: "1.0"
+network_cidr: 10.0.0.0/8
+mtu: 1420
+
+obfuscation_enabled: true
+
+nodes:
+  # Site A: US-East
+  - name: site-a-gw1
+    endpoint: 198.51.100.10:51820
+    address: 10.30.1.1/32
+    allowed_ips:
+      - 10.30.0.0/16       # Site A subnets
+      - 10.30.1.0/24
+    obfuscation:
+      enabled: true
+      Jc: 10
+      Jmin: 60
+      Jmax: 120
+    tags:
+      site: us-east
+      role: gateway
+      tier: primary
+
+  - name: site-a-gw2
+    endpoint: 198.51.100.11:51821
+    address: 10.30.1.2/32
+    allowed_ips:
+      - 10.30.0.0/16
+      - 10.30.1.0/24
+    obfuscation:
+      enabled: true
+      Jc: 10
+      Jmin: 60
+      Jmax: 120
+    tags:
+      site: us-east
+      role: gateway
+      tier: backup
+
+  # Site B: EU-West
+  - name: site-b-gw1
+    endpoint: 203.0.113.20:51820
+    address: 10.30.2.1/32
+    allowed_ips:
+      - 10.30.2.0/24
+    tags:
+      site: eu-west
+      role: gateway
+      tier: primary
+
+  - name: site-b-gw2
+    endpoint: 203.0.113.21:51821
+    address: 10.30.2.2/32
+    allowed_ips:
+      - 10.30.2.0/24
+    tags:
+      site: eu-west
+      role: gateway
+      tier: backup
+
+tunnels:
+  # Cross-site mesh between gateways (4 tunnels for redundancy)
+  - name: a1-to-b1
+    source: site-a-gw1
+    target: site-b-gw1
+    metric: 100
+
+  - name: a1-to-b2
+    source: site-a-gw1
+    target: site-b-gw2
+    metric: 200          # Higher metric = backup path
+
+  - name: a2-to-b1
+    source: site-a-gw2
+    target: site-b-gw1
+    metric: 200
+
+  - name: a2-to-b2
+    source: site-a-gw2
+    target: site-b-gw2
+    metric: 300          # Lowest priority
+
+  # Intra-site tunnels (gateway peering within same site)
+  - name: site-a-internal
+    source: site-a-gw1
+    target: site-a-gw2
+    metric: 10
+
+  - name: site-b-internal
+    source: site-b-gw1
+    target: site-b-gw2
+    metric: 10
+
+policies:
+  # Allow all traffic between sites
+  - name: allow-cross-site
+    source: 10.30.0.0/16
+    destination: 10.30.0.0/16
+    action: allow
+    priority: 100
+
+  # Rate-limit backup traffic
+  - name: allow-backups
+    source: 10.30.0.0/16
+    destination: 10.30.2.0/24
+    action: allow
+    port: 8730
+    protocol: tcp
+    priority: 90
