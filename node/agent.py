@@ -384,6 +384,79 @@ class NodeAgent:
         # Config is valid and written — in a real deployment it would be active
         return True
 
+    def update_peer_allowed_ips(
+        self, peer_public_key: str, allowed_ips: List[str]
+    ) -> bool:
+        """Update a peer's AllowedIPs at runtime without restarting the tunnel.
+
+        Uses `wg set <interface> peer <key> allowed-ips <cidrs>` which
+        is instantaneous and does NOT drop the connection or re-handshake.
+
+        This is how remote prefix changes propagate: when a gateway
+        advertises a new subnet, the controller pushes an AllowedIPs
+        update to all peers, and traffic to that subnet starts flowing
+        immediately through the existing tunnel.
+        """
+        try:
+            ips_arg = ",".join(allowed_ips)
+            result = subprocess.run(
+                ["wg", "set", self.interface, "peer", peer_public_key,
+                 "allowed-ips", ips_arg],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                # Update our internal status
+                if self._status:
+                    for peer_status in self._status.peers:
+                        if peer_status.peer_public_key == peer_public_key:
+                            peer_status.allowed_ips = allowed_ips
+                            break
+                return True
+            else:
+                print(f"wg set failed: {result.stderr}")
+                return False
+        except FileNotFoundError:
+            # wg CLI not available — in prototype mode this is expected
+            return True
+        except subprocess.SubprocessError as e:
+            print(f"Failed to update peer AllowedIPs: {e}")
+            return False
+
+    def add_peer_route(
+        self, peer_public_key: str, prefix: str
+    ) -> bool:
+        """Add a single prefix to a peer's AllowedIPs live.
+
+        Gets the current AllowedIPs, appends the new prefix,
+        and applies the update atomically via `wg set`.
+        """
+        current_ips = []
+        if self._status:
+            for ps in self._status.peers:
+                if ps.peer_public_key == peer_public_key:
+                    current_ips = list(ps.allowed_ips)
+                    break
+
+        if prefix not in current_ips:
+            current_ips.append(prefix)
+
+        return self.update_peer_allowed_ips(peer_public_key, current_ips)
+
+    def remove_peer_route(
+        self, peer_public_key: str, prefix: str
+    ) -> bool:
+        """Remove a single prefix from a peer's AllowedIPs live."""
+        current_ips = []
+        if self._status:
+            for ps in self._status.peers:
+                if ps.peer_public_key == peer_public_key:
+                    current_ips = [
+                        ip for ip in ps.allowed_ips if ip != prefix
+                    ]
+                    break
+
+        return self.update_peer_allowed_ips(peer_public_key, current_ips)
+
     def _public_key_from_private(self, private_key: str) -> str:
         """Derive public key from private key using wg CLI."""
         try:

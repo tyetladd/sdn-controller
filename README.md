@@ -104,23 +104,189 @@ PersistentKeepalive = 25
 | GET | `/api/v1/configs/generate` | Generate all configs |
 | GET | `/api/v1/configs/<node>` | Get node config (wg-quick/amneziawg/json) |
 | POST | `/api/v1/evaluate` | Evaluate flow against policies |
+| PUT | `/api/v1/nodes/<name>/allowed-ips` | **Runtime:** update a node's AllowedIPs |
+| POST | `/api/v1/nodes/<name>/allowed-ips/add` | **Runtime:** add a single prefix |
+| POST | `/api/v1/nodes/<name>/allowed-ips/remove` | **Runtime:** remove a single prefix |
+
+## How Traffic Routing Works
+
+Routing in the SDN happens at two levels. The controller plans routes, but WireGuard itself enforces them.
+
+### Layer 1: WireGuard Cryptokey Routing
+
+WireGuard doesn't use IP routing — it uses **cryptokey routing**. The `AllowedIPs` field in each `[Peer]` section maps IP prefixes to peer public keys. When the kernel sends a packet, it looks up the destination IP in the WireGuard peer table, encrypts the packet with the matching peer's public key, and sends it through that tunnel.
+
+```
+Packet to 10.20.10.5 arrives at wg0
+  → Kernel checks: which peer has 10.20.10.5 in AllowedIPs?
+  → Match: peer "dc" with AllowedIPs = 10.20.10.0/24
+  → Encrypt with dc's public key, send to dc's endpoint
+```
+
+### Layer 2: Hub Forwarding (Hub-Spoke Topology)
+
+In a hub-spoke topology, the hub acts as a router between spokes. WireGuard itself does NOT forward between peers — the Linux kernel does, using standard IP forwarding.
+
+**Step-by-step: spoke-1 sends a packet to spoke-2's subnet (192.168.2.5):**
+
+```
+1. spoke-1 kernel:
+   Packet dst=192.168.2.5 → matches AllowedIPs 10.20.0.0/16 on hub peer
+   → encrypt with hub's key → send to hub:51820
+
+2. hub receives encrypted packet:
+   → decrypt with own key → plaintext packet dst=192.168.2.5
+   → kernel IP forward: lookup route for 192.168.2.5
+   → matches AllowedIPs 192.168.2.0/24 on spoke-2 peer
+   → re-encrypt with spoke-2's key → send to spoke-2:51820
+
+3. spoke-2 receives encrypted packet:
+   → decrypt → packet delivered to 192.168.2.5
+```
+
+**Hub requirements:**
+
+```bash
+# The hub MUST have IP forwarding enabled
+sysctl -w net.ipv4.ip_forward=1
+sysctl -w net.ipv6.conf.all.forwarding=1
+
+# The controller generates these iptables rules automatically
+# from your YAML policy definitions:
+iptables -A FORWARD -i wg0 -o wg0 -s 10.20.0.0/16 -d 192.168.0.0/16 -j ACCEPT
+```
+
+Without `ip_forward=1`, the hub decrypts the packet but drops it instead of forwarding.
+
+### Routing in Different Topologies
+
+**Mesh** — every node has a direct tunnel to every other node. AllowedIPs point directly at each peer. Lowest latency, no forwarding hop. Best for ≤10 nodes.
+
+```
+[Peer] spoke-2  AllowedIPs = 10.20.2.1/32, 192.168.2.0/24
+[Peer] spoke-3  AllowedIPs = 10.20.3.1/32, 192.168.3.0/24
+```
+
+**Hub-Spoke** — spokes only have one peer (the hub) with a broad AllowedIPs. The hub has specific AllowedIPs for each spoke. All inter-spoke traffic goes through the hub.
+
+```
+# Spoke config:
+[Peer] hub  AllowedIPs = 10.20.0.0/16    # everything through hub
+
+# Hub config:
+[Peer] spoke-1  AllowedIPs = 10.20.1.1/32, 192.168.1.0/24
+[Peer] spoke-2  AllowedIPs = 10.20.2.1/32, 192.168.2.0/24
+[Peer] spoke-3  AllowedIPs = 10.20.3.1/32, 192.168.3.0/24
+```
+
+**Site-to-Site** — redundant tunnels with metrics. Multiple gateways per site. WireGuard handles failover automatically: if a peer stops responding to handshakes, traffic uses the next matching peer.
+
+```
+# Site A GW1 config:
+[Peer] site-b-gw1  AllowedIPs = 10.30.2.0/24  # metric 100 (primary)
+[Peer] site-b-gw2  AllowedIPs = 10.30.2.0/24  # metric 200 (backup)
+# Both peers have the SAME AllowedIPs → WireGuard picks the one
+# with a recent handshake. If primary goes down, backup takes over.
+```
+
+### Controller Route Planning vs WireGuard Enforcement
+
+The controller's `calculate_routing_table()` in `common/net.py` computes optimal paths using Dijkstra's algorithm based on tunnel metrics. This is for **planning and verification** — it shows you what the routes *should* be. The actual packet forwarding is always handled by WireGuard's cryptokey routing table in the kernel.
+
+Use the controller's routing table to:
+- Verify the topology is fully connected
+- Check that metric-based failover paths exist
+- Audit that policies don't create routing black holes
+
+## Runtime Reconfiguration: Live AllowedIPs Updates
+
+**Yes, the controller can update AllowedIPs at runtime without dropping tunnels.** This is one of WireGuard's key strengths — `wg set` modifies a peer's AllowedIPs instantly with no tunnel restart, no re-handshake, and no packet loss.
+
+### Use case: a remote gateway advertises a new subnet
+
+```bash
+# A new prefix 10.99.0.0/24 is added behind spoke-office-1.
+# Update the controller topology and push to all peers:
+
+# Via CLI:
+python3 cli/sdnctl.py -t examples/hub_spoke.yaml tunnel add-prefix spoke-office-1 10.99.0.0/24
+
+# Via API:
+curl -X POST http://localhost:8080/api/v1/nodes/spoke-office-1/allowed-ips/add \
+  -H 'Content-Type: application/json' \
+  -d '{"prefix": "10.99.0.0/24"}'
+```
+
+**What the controller returns:**
+
+```
+Added prefix '10.99.0.0/24' to node 'spoke-office-1'
+  Added:   ['10.99.0.0/24']
+  Removed: []
+  Current: ['192.168.1.0/24', '10.99.0.0/24']
+  Peers to update (1):
+    hub-primary -> AllowedIPs = ['10.20.1.1/32', '192.168.1.0/24', '10.99.0.0/24']
+```
+
+**On the actual hub node, the agent runs (or you run manually):**
+
+```bash
+# This takes effect instantly — no tunnel restart, no packet loss
+wg set wg0 peer <spoke-office-1-pubkey> allowed-ips 10.20.1.1/32,192.168.1.0/24,10.99.0.0/24
+```
+
+Traffic to `10.99.0.0/24` now flows through the existing tunnel immediately.
+
+### What you can change at runtime without dropping tunnels
+
+| Operation | Command | Tunnel impact |
+|-----------|---------|---------------|
+| Add a route prefix | `wg set wg0 peer <key> allowed-ips <new-list>` | None |
+| Remove a route prefix | `wg set wg0 peer <key> allowed-ips <new-list>` | None |
+| Change endpoint | `wg set wg0 peer <key> endpoint <new-ip:port>` | Re-handshake only |
+| Change PSK | `wg set wg0 peer <key> preshared-key <file>` | Re-handshake only |
+| Replace private key | `wg set wg0 private-key <file>` | Re-handshake only |
+| Remove a peer | `wg set wg0 peer <key> remove` | That peer disconnected |
+
+What you **cannot** change at runtime: the listen port (requires interface restart).
+
+### Step-by-step: adding a new remote subnet
+
+```
+1. New subnet 10.99.0.0/24 comes online behind spoke-office-1
+
+2. Operator updates the SDN controller:
+   $ sdnctl -t hub_spoke.yaml tunnel add-prefix spoke-office-1 10.99.0.0/24
+
+3. Controller returns the list of peers that need updating:
+   - hub-primary needs its [Peer] for spoke-office-1 updated
+
+4. Controller (or operator) pushes the update to hub-primary:
+   $ ssh hub-primary wg set wg0 peer <key> allowed-ips 10.20.1.1/32,192.168.1.0/24,10.99.0.0/24
+
+5. Done. Traffic to 10.99.0.0/24 flows through the existing tunnel.
+   No restart, no packet loss, no re-handshake on OTHER peers.
+```
 
 ## Architecture
 
 ```
-Controller (Python)          Node Agents (Python)
-┌─────────────────┐          ┌─────────────────┐
-│ REST API / CLI  │◄────────►│ Config Applier   │
-│ Topology Mgr    │  HTTPS   │ Health Monitor   │
-│ Tunnel Gen      │          │ Traffic Stats    │
-│ Policy Engine   │          │ Alert Manager    │
-│ Key Manager     │          └─────────────────┘
-└─────────────────┘                  │
-                                     ▼
-                            ┌─────────────────┐
-                            │ WireGuard/       │
-                            │ AmneziaWG Kernel │
-                            └─────────────────┘
+Controller (Python)               Node Agents (Python)
+┌──────────────────────┐          ┌──────────────────────┐
+│ REST API / CLI       │◄────────►│ Config Applier        │
+│ Topology Manager     │  HTTPS   │   wg-quick up         │
+│ Tunnel Config Gen    │          │   wg set (live)       │
+│ Policy Engine        │          │ Health Monitor        │
+│ Key Manager          │          │ Traffic Stats         │
+│ Route Calculator     │          │ Alert Manager         │
+└──────────────────────┘          └──────┬───────────────┘
+                                         │
+                                         ▼
+                                ┌──────────────────────┐
+                                │ WireGuard/AmneziaWG   │
+                                │ Kernel cryptokey route │
+                                │ + IP forwarding (hub)  │
+                                └──────────────────────┘
 ```
 
 ## AmneziaWG vs WireGuard

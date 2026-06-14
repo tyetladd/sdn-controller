@@ -145,6 +145,60 @@ def create_app(
             )
         return jsonify({"error": "Tunnel not found"}), 404
 
+    # ── Runtime Reconfiguration ──────────────────────────────────
+
+    @app.route("/api/v1/nodes/<name>/allowed-ips", methods=["PUT"])
+    def update_node_allowed_ips(name: str):
+        """Update a node's AllowedIPs at runtime (live reconfiguration).
+
+        Request body: {"allowed_ips": ["10.20.1.0/24", "10.99.0.0/24"]}
+
+        Returns the diff and the list of peers that need updating.
+        No tunnels are dropped — peers can be updated via `wg set`.
+        """
+        data = request.get_json(force=True)
+        new_ips = data.get("allowed_ips", [])
+        try:
+            result = tm.update_node_allowed_ips(name, new_ips)
+            return jsonify(result)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 404
+
+    @app.route("/api/v1/nodes/<name>/allowed-ips/add", methods=["POST"])
+    def add_node_prefix(name: str):
+        """Add a single prefix to a node's AllowedIPs (live).
+
+        Request body: {"prefix": "10.99.0.0/24"}
+
+        Example: a remote gateway starts advertising a new subnet.
+        Call this and all peers get the new route without re-handshaking.
+        """
+        data = request.get_json(force=True)
+        prefix = data.get("prefix", "")
+        if not prefix:
+            return jsonify({"error": "prefix is required"}), 400
+        try:
+            result = tm.add_node_prefix(name, prefix)
+            return jsonify(result)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 404
+
+    @app.route("/api/v1/nodes/<name>/allowed-ips/remove", methods=["POST"])
+    def remove_node_prefix(name: str):
+        """Remove a single prefix from a node's AllowedIPs (live).
+
+        Request body: {"prefix": "10.99.0.0/24"}
+        """
+        data = request.get_json(force=True)
+        prefix = data.get("prefix", "")
+        if not prefix:
+            return jsonify({"error": "prefix is required"}), 400
+        try:
+            result = tm.remove_node_prefix(name, prefix)
+            return jsonify(result)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 404
+
     # ── Policies ─────────────────────────────────────────────────
 
     @app.route("/api/v1/policies", methods=["GET"])

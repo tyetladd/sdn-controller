@@ -256,6 +256,94 @@ class TopologyManager:
     def list_tunnels(self) -> List[Dict[str, Any]]:
         return [t.to_dict() for t in self._topology.tunnels]
 
+    # ── Runtime reconfiguration ──────────────────────────────────────
+
+    def update_node_allowed_ips(
+        self, node_name: str, allowed_ips: List[str]
+    ) -> Dict[str, Any]:
+        """Update a node's AllowedIPs and return the diff for peer updates.
+
+        When a remote gateway gets a new prefix, call this to update
+        its AllowedIPs. It returns the list of peers that need their
+        WireGuard configs updated — without tearing down any tunnels.
+
+        Returns a dict with:
+          - node: updated node name
+          - added: new prefixes
+          - removed: removed prefixes
+          - current: full AllowedIPs list
+          - peers_to_update: list of {peer_name, peer_pubkey, new_allowed_ips}
+        """
+        node = self._topology.get_node(node_name)
+        if not node:
+            raise ValueError(f"Node '{node_name}' not found")
+
+        old_ips = set(node.allowed_ips)
+        new_ips = set(allowed_ips)
+
+        added = list(new_ips - old_ips)
+        removed = list(old_ips - new_ips)
+
+        # Update the node's AllowedIPs
+        node.allowed_ips = allowed_ips
+
+        # Find all peers that need updating — every node that has a
+        # tunnel TO this node needs to update their [Peer] section
+        peers_to_update = []
+        for tunnel in self._topology.tunnels:
+            peer_name = None
+            if tunnel.source_node == node_name:
+                peer_name = tunnel.target_node
+            elif tunnel.target_node == node_name:
+                peer_name = tunnel.source_node
+
+            if peer_name:
+                peer = self._topology.get_node(peer_name)
+                if peer:
+                    # The peer's AllowedIPs for this node = node.added_ips + node.address
+                    peer_allowed = [node.address] + allowed_ips if node.address else list(allowed_ips)
+                    peers_to_update.append({
+                        "peer_name": peer_name,
+                        "peer_public_key": peer.public_key,
+                        "peer_endpoint": peer.endpoint,
+                        "new_allowed_ips_for_this_node": peer_allowed,
+                    })
+
+        self._bump_version()
+        return {
+            "node": node_name,
+            "added": added,
+            "removed": removed,
+            "current": allowed_ips,
+            "peers_to_update": peers_to_update,
+        }
+
+    def add_node_prefix(self, node_name: str, prefix: str) -> Dict[str, Any]:
+        """Add a single prefix to a node's AllowedIPs (live update).
+
+        Example: a remote gateway is now advertising 10.99.0.0/24.
+        Call add_node_prefix('spoke-1', '10.99.0.0/24') and all
+        peers will be told to route that prefix through this node.
+        """
+        node = self._topology.get_node(node_name)
+        if not node:
+            raise ValueError(f"Node '{node_name}' not found")
+
+        if prefix in node.allowed_ips:
+            return self.update_node_allowed_ips(node_name, node.allowed_ips)
+
+        new_ips = list(node.allowed_ips) + [prefix]
+        return self.update_node_allowed_ips(node_name, new_ips)
+
+    def remove_node_prefix(self, node_name: str, prefix: str) -> Dict[str, Any]:
+        """Remove a single prefix from a node's AllowedIPs (live update)."""
+        node = self._topology.get_node(node_name)
+        if not node:
+            raise ValueError(f"Node '{node_name}' not found")
+
+        new_ips = [ip for ip in node.allowed_ips if ip != prefix]
+        return self.update_node_allowed_ips(node_name, new_ips)
+
     # ── Policy management ────────────────────────────────────────────
 
     def add_policy(

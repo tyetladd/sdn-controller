@@ -185,6 +185,35 @@ class SdnCtl:
                     f"{t['metric']}"
                 )
 
+        elif args.tunnel_action == "add-prefix":
+            if not self.tm:
+                print("No topology loaded.")
+                return
+            try:
+                result = self.tm.add_node_prefix(args.tunnel_node, args.prefix)
+                print(f"Added prefix '{args.prefix}' to node '{args.tunnel_node}'")
+                print(f"  Added:   {result['added']}")
+                print(f"  Removed: {result['removed']}")
+                print(f"  Current: {result['current']}")
+                print(f"  Peers to update ({len(result['peers_to_update'])}):")
+                for p in result['peers_to_update']:
+                    print(f"    {p['peer_name']} -> AllowedIPs = {p['new_allowed_ips_for_this_node']}")
+            except Exception as e:
+                print(f"Error: {e}")
+                return 1
+
+        elif args.tunnel_action == "remove-prefix":
+            if not self.tm:
+                print("No topology loaded.")
+                return
+            try:
+                result = self.tm.remove_node_prefix(args.tunnel_node, args.prefix)
+                print(f"Removed prefix '{args.prefix}' from node '{args.tunnel_node}'")
+                print(f"  Current: {result['current']}")
+            except Exception as e:
+                print(f"Error: {e}")
+                return 1
+
         elif args.tunnel_action == "create":
             if not self.tm:
                 print("No topology loaded.")
@@ -444,6 +473,12 @@ def main():
     remove_tun = tun_sub.add_parser("remove", help="Remove a tunnel")
     remove_tun.add_argument("source", help="Source node")
     remove_tun.add_argument("target", help="Target node")
+    add_pfx = tun_sub.add_parser("add-prefix", help="Add a prefix to a node's AllowedIPs (live update)")
+    add_pfx.add_argument("tunnel_node", help="Node name")
+    add_pfx.add_argument("prefix", help="CIDR prefix to add (e.g. 10.99.0.0/24)")
+    rmv_pfx = tun_sub.add_parser("remove-prefix", help="Remove a prefix from a node's AllowedIPs")
+    rmv_pfx.add_argument("tunnel_node", help="Node name")
+    rmv_pfx.add_argument("prefix", help="CIDR prefix to remove")
 
     # ── policy ───────────────────────────────────────────────────
     pol_parser = subparsers.add_parser("policy", help="Policy management")
