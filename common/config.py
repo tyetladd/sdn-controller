@@ -194,6 +194,37 @@ class PolicyRule:
 
 
 @dataclass
+class VxlanTopologyConfig:
+    """VXLAN overlay configuration within a topology."""
+    enabled: bool = False
+    vni: int = 100
+    vxlan_network: str = "172.30.0.0/16"
+    mtu: int = 1400
+    dst_port: int = 4789
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "vni": self.vni,
+            "vxlan_network": self.vxlan_network,
+            "mtu": self.mtu,
+            "dst_port": self.dst_port,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "VxlanTopologyConfig":
+        if data is None:
+            return cls()
+        return cls(
+            enabled=data.get("enabled", False),
+            vni=data.get("vni", 100),
+            vxlan_network=data.get("vxlan_network", "172.30.0.0/16"),
+            mtu=data.get("mtu", 1400),
+            dst_port=data.get("dst_port", 4789),
+        )
+
+
+@dataclass
 class TopologyConfig:
     """Complete SDN topology definition."""
     name: str
@@ -206,6 +237,7 @@ class TopologyConfig:
     policies: List[PolicyRule] = field(default_factory=list)
     obfuscation_enabled: bool = False
     default_obfuscation: Optional[AmneziaObfuscation] = None
+    vxlan: VxlanTopologyConfig = field(default_factory=VxlanTopologyConfig)
 
     def get_node(self, name: str) -> Optional[NodeConfig]:
         for node in self.nodes:
@@ -279,6 +311,8 @@ class TopologyConfig:
             d["obfuscation_enabled"] = True
         if self.default_obfuscation and self.default_obfuscation.enabled:
             d["default_obfuscation"] = self.default_obfuscation.to_dict()
+        if self.vxlan.enabled:
+            d["vxlan"] = self.vxlan.to_dict()
         return d
 
     @staticmethod
@@ -312,6 +346,7 @@ class TopologyConfig:
             default_obfuscation=AmneziaObfuscation.from_dict(
                 data.get("default_obfuscation")
             ),
+            vxlan=VxlanTopologyConfig.from_dict(data.get("vxlan")),
         )
 
 

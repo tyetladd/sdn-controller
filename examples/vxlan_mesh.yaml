@@ -1,0 +1,115 @@
+# VXLAN-over-WireGuard Mesh Topology
+#
+# VXLAN creates a flat L2 overlay on top of the WireGuard mesh.
+# WireGuard AllowedIPs only carry the VXLAN endpoint IPs (fixed).
+# All behind-node subnets are routed within VXLAN, dramatically
+# reducing management overhead.
+#
+# Without VXLAN (per-peer AllowedIPs):
+#   peer B: 10.20.2.1/32, 192.168.2.0/24, 10.99.0.0/24, ...
+#   peer C: 10.20.3.1/32, 192.168.3.0/24, 172.31.0.0/16, ...
+#   ↑ changes every time a subnet is added behind B or C
+#
+# With VXLAN (per-peer AllowedIPs):
+#   peer B: 172.30.0.2/32   ← fixed, never changes
+#   peer C: 172.30.0.3/32   ← fixed, never changes
+#   ↑ VXLAN handles all subnet routing internally
+
+name: vxlan-mesh-network
+description: |
+  Full mesh topology with VXLAN overlay on top of WireGuard.
+  WireGuard handles encryption and tunnel transport.
+  VXLAN creates a single L2 domain across all nodes.
+  Behind-node subnets are routed within VXLAN (not via WireGuard AllowedIPs).
+  Adding a new subnet: 0 WireGuard config changes required.
+
+version: "1.0"
+network_cidr: 10.0.0.0/8
+mtu: 1400          # Reduced from 1420 to account for VXLAN encapsulation (50 bytes)
+
+# VXLAN configuration
+vxlan:
+  enabled: true
+  vni: 100
+  vxlan_network: "172.30.0.0/16"
+  mtu: 1400
+  dst_port: 4789
+
+# AmneziaWG obfuscation (optional, works with VXLAN)
+obfuscation_enabled: true
+default_obfuscation:
+  enabled: true
+  Jc: 5
+  Jmin: 40
+  Jmax: 80
+
+nodes:
+  - name: node-nyc
+    endpoint: 198.51.100.10:51820
+    address: 10.20.1.1/32
+    allowed_ips:
+      - 192.168.1.0/24     # NYC office subnet
+      - 10.10.0.0/16       # NYC container network
+    tags:
+      region: us-east
+      role: edge
+
+  - name: node-lon
+    endpoint: 203.0.113.20:51820
+    address: 10.20.2.1/32
+    allowed_ips:
+      - 192.168.2.0/24     # London office subnet
+      - 10.20.0.0/16       # London container network
+    tags:
+      region: eu-west
+      role: edge
+
+  - name: node-sgp
+    endpoint: 192.0.2.30:51820
+    address: 10.20.3.1/32
+    allowed_ips:
+      - 192.168.3.0/24     # Singapore office subnet
+      - 10.30.0.0/16       # Singapore container network
+    tags:
+      region: ap-southeast
+      role: edge
+
+  - name: node-sfo
+    endpoint: 198.51.100.40:51820
+    address: 10.20.4.1/32
+    allowed_ips:
+      - 192.168.4.0/24     # SFO office subnet
+      - 10.40.0.0/16       # SFO container network
+    tags:
+      region: us-west
+      role: edge
+
+tunnels:
+  # Full mesh between all 4 nodes
+  - node-nyc:node-lon
+  - node-nyc:node-sgp
+  - node-nyc:node-sfo
+  - node-lon:node-sgp
+  - node-lon:node-sfo
+  - node-sgp:node-sfo
+
+policies:
+  # Allow all VXLAN-traversing traffic
+  - name: allow-vxlan-overlay
+    source: 172.30.0.0/16
+    destination: 172.30.0.0/16
+    action: allow
+    priority: 100
+
+  # Allow traffic to all behind-node subnets
+  - name: allow-all-subnets
+    source: 10.0.0.0/8
+    destination: 10.0.0.0/8
+    action: allow
+    priority: 90
+
+  - name: allow-office-subnets
+    source: 192.168.0.0/16
+    destination: 192.168.0.0/16
+    action: allow
+    priority: 90

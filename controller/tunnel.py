@@ -79,8 +79,9 @@ class TunnelConfigGenerator:
     DEFAULT_JUNK_MAX = 80
     DEFAULT_PERSISTENT_KEEPALIVE = 25
 
-    def __init__(self, topology: TopologyConfig):
+    def __init__(self, topology: TopologyConfig, vxlan_manager=None):
         self.topology = topology
+        self.vxlan = vxlan_manager  # Optional VxlanOverlayManager
 
     def generate_all_configs(self) -> Dict[str, GeneratedNodeConfig]:
         """Generate configs for all nodes in the topology."""
@@ -107,7 +108,16 @@ class TunnelConfigGenerator:
             allowed_ips = []
             if peer_node.address:
                 allowed_ips.append(peer_node.address)
-            allowed_ips.extend(peer_node.allowed_ips)
+
+            # In VXLAN mode, AllowedIPs only carries the peer's VXLAN IP
+            # (a single /32). Behind-node subnets are routed within VXLAN
+            # via static routes or BGP — not via WireGuard AllowedIPs.
+            if self.vxlan:
+                vxlan_entry = self.vxlan.get_node_entry(peer_name)
+                if vxlan_entry:
+                    allowed_ips = [vxlan_entry.vxlan_ip]
+            else:
+                allowed_ips.extend(peer_node.allowed_ips)
 
             peer_config = GeneratedPeerConfig(
                 public_key=peer_node.public_key or "",
